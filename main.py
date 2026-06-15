@@ -16,6 +16,7 @@ How it works:
 """
 
 import os
+import json
 import asyncio
 import logging
 import requests
@@ -43,6 +44,9 @@ DEFAULT_LON = 34.7818
 
 # How often to check monitored restaurants (in seconds)
 MONITOR_INTERVAL = 120  # 2 minutes
+
+# File to persist monitoring state across restarts
+MONITOR_FILE = "monitored.json"
 
 # ──────────────────────────────────────────────
 # WOLT API LAYER
@@ -158,13 +162,11 @@ def search_restaurants(query: str, lat: float = DEFAULT_LAT, lon: float = DEFAUL
 
 def check_venue_status(slug: str) -> dict | None:
     """
-    Check a specific restaurant's current status by its slug.
-    The slug is the URL part — e.g., wolt.com/en/isr/tel-aviv/restaurant/SLUG
-
-    WHAT'S HAPPENING: We call Wolt's venue-specific endpoint to get
-    detailed, real-time status of one restaurant.
+    Check a specific restaurant's current (live) status by its slug.
+    Uses the same restaurants endpoint as search — the /static endpoint
+    does not include real-time online status.
     """
-    url = f"{WOLT_API_BASE}/order-xp/web/v1/pages/venue/slug/{slug}/static"
+    url = f"{WOLT_API_BASE}/v1/pages/restaurants"
     params = {"lat": DEFAULT_LAT, "lon": DEFAULT_LON}
 
     try:
@@ -172,23 +174,12 @@ def check_venue_status(slug: str) -> dict | None:
         response.raise_for_status()
         data = response.json()
 
-        venue = data.get("venue", {})
-        if not venue:
-            # Try alternative structure
-            for section in data.get("sections", []):
-                if "venue" in section:
-                    venue = section["venue"]
-                    break
+        for section in data.get("sections", []):
+            for item in section.get("items", []):
+                venue = _extract_venue(item)
+                if venue and venue["slug"] == slug:
+                    return venue
 
-        if venue:
-            return {
-                "name": venue.get("name", slug),
-                "slug": slug,
-                "online": venue.get("online", False),
-                "delivers": venue.get("delivers", False),
-                "short_description": venue.get("short_description", ""),
-                "estimate_minutes": venue.get("estimate", 0),
-            }
         return None
 
     except requests.RequestException as e:
@@ -201,9 +192,24 @@ def check_venue_status(slug: str) -> dict | None:
 # Stores which restaurants each user is watching
 # ──────────────────────────────────────────────
 
-# In-memory store: { chat_id: { slug: { name, last_status, ... } } }
-# For a production bot, you'd use a database (Supabase, Redis, etc.)
-monitored = {}
+# Persisted store: { chat_id: { slug: { name, last_status, ... } } }
+# Saved to MONITOR_FILE so state survives process restarts.
+
+def _load_monitored() -> dict:
+    try:
+        with open(MONITOR_FILE) as f:
+            data = json.load(f)
+        return {int(k): v for k, v in data.items()}  # JSON keys are always strings
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_monitored() -> None:
+    with open(MONITOR_FILE, "w") as f:
+        json.dump(monitored, f)
+
+
+monitored = _load_monitored()
 
 
 async def monitor_loop(app: Application) -> None:
@@ -216,7 +222,7 @@ async def monitor_loop(app: Application) -> None:
 
         for chat_id, restaurants in list(monitored.items()):
             for slug, info in list(restaurants.items()):
-                status = check_venue_status(slug)
+                status = await asyncio.to_thread(check_venue_status, slug)
                 if status is None:
                     continue
 
@@ -246,6 +252,7 @@ async def monitor_loop(app: Application) -> None:
 
                 # Update stored status
                 info["last_status"] = is_online
+                _save_monitored()
 
 
 # ──────────────────────────────────────────────
@@ -389,6 +396,7 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "last_status": status["online"],
         "started": datetime.now().isoformat(),
     }
+    _save_monitored()
 
     current = "🟢 OPEN" if status["online"] else "🔴 CLOSED"
 
@@ -414,6 +422,7 @@ async def unmonitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat_id in monitored and slug in monitored[chat_id]:
         name = monitored[chat_id][slug]["name"]
         del monitored[chat_id][slug]
+        _save_monitored()
         await update.message.reply_text(f"🛑 Stopped monitoring *{name}*.", parse_mode="Markdown")
     else:
         await update.message.reply_text("You're not monitoring that restaurant.")
@@ -474,6 +483,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "last_status": status["online"] if status else False,
             "started": datetime.now().isoformat(),
         }
+        _save_monitored()
 
         await query.message.reply_text(
             f"👁 Now monitoring *{name}*. I'll ping you when it opens/closes.",
